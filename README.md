@@ -360,4 +360,7 @@ cat /tmp/weston-input.log /tmp/weston-app.log /tmp/weston-run.log
 python3 input-server.py --display "$(cat /tmp/weston-xdisplay)" --selftest
 ```
 ## 14. Cosas posibles
-   Ver en diferentes dispositivos y controlar desde los diferentes dispositivos, además de ver lo que hace una persona en remoto
+   Ver en diferentes dispositivos y controlar desde los diferentes dispositivos, además de ver lo que hace una persona en remotoç
+
+## 15. Licenses
+
