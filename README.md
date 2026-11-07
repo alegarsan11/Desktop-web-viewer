@@ -364,3 +364,12 @@ python3 input-server.py --display "$(cat /tmp/weston-xdisplay)" --selftest
 
 ## 15. Licenses
 
+Licence type	Components
+Permissive	9
+Weak copyleft (LGPL)	2
+Strong copyleft (GPL)	2
+GPL + exception	1
+Proprietary	2
+Total	16
+
+![alt text](image.png)
