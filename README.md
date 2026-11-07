@@ -373,3 +373,6 @@ Proprietary	2
 Total	16
 
 ![alt text](image.png)
+
+## 16. Challenge
+   It works fine but if you see I'm using acceleration by HW with nvidia drivers (renderer gl) to check with intel integrated
