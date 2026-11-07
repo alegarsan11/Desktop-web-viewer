@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Weston Remote</title>
+<style>
+  :root { --bg:#0f0f10; --bar:#1a1a1c; --fg:#eaeaea; --muted:#8b8b92; --accent:#4ea1ff;
+          --ok:#3ecf6e; --bad:#ff5a5a; --warn:#f2b84b; }
+  * { box-sizing:border-box; }
+  html, body { height:100%; margin:0; }
+  body { background:var(--bg); color:var(--fg); font:14px system-ui,sans-serif;
+         display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; gap:10px; padding:8px 12px; background:var(--bar);
+           border-bottom:1px solid #2a2a2e; flex-wrap:wrap; }
+  header .title { font-weight:600; margin-right:6px; }
+  button { background:#27272b; color:var(--fg); border:1px solid #3a3a40; border-radius:6px;
+           padding:6px 10px; font:inherit; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  .pill { display:inline-flex; align-items:center; gap:6px; color:var(--muted); font-size:13px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--bad); }
+  .dot.ok { background:var(--ok); } .dot.wait { background:var(--warn); }
+  .spacer { flex:1; }
+  #stage { flex:1; min-height:0; position:relative; background:#000; outline:none;
+           touch-action:none; user-select:none; -webkit-user-select:none; cursor:default; }
+  #stage:focus { box-shadow: inset 0 0 0 2px var(--accent); }
+  video { width:100%; height:100%; object-fit:contain; display:block; background:#000; }
+  #hint { position:absolute; inset:auto 0 14px 0; text-align:center; pointer-events:none;
+          color:#fff; opacity:.75; font-size:13px; text-shadow:0 1px 3px #000; transition:opacity .4s; }
+  #msg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+         text-align:center; padding:20px; color:var(--muted); pointer-events:none; white-space:pre-line; }
+  #msg:empty { display:none; }
+</style>
+</head>
+<body>
+<header>
+  <span class="title">Weston Remote</span>
+  <span class="pill"><span id="vdot" class="dot"></span><span id="vtxt">video</span></span>
+  <span class="pill"><span id="idot" class="dot"></span><span id="itxt">control</span></span>
+  <span class="pill" id="stats"></span>
+  <span class="spacer"></span>
+  <button id="btnReconnect">Reconectar</button>
+  <button id="btnFull">Pantalla completa</button>
+</header>
+
+<div id="stage" tabindex="0">
+  <video id="video" autoplay muted playsinline></video>
+  <div id="msg">Conectando…</div>
+  <div id="hint">Haz clic en el vídeo para controlar la app (ratón, rueda y teclado)</div>
+</div>
+
+<script>
+// ---------- Config (override with ?host=&path=&webrtc=&input=&token=) ----------
+const q = new URLSearchParams(location.search);
+const HOST   = q.get('host')   || location.hostname || 'localhost';
+const PATH   = q.get('path')   || 'desktop';
+const WEBRTC = q.get('webrtc') || '8889';
+const TOKEN  = q.get('token')  || '';
+const HTTP   = location.protocol === 'https:' ? 'https' : 'http';
+const WSBASE = q.get('input') ||
+  (location.protocol === 'file:' ? `ws://${HOST}:8090/ws`
+                                 : `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+
+const $ = id => document.getElementById(id);
+const video = $('video'), stage = $('stage'), msg = $('msg');
+
+function setDot(dot, txt, state, label) {
+  $(dot).className = 'dot ' + state; $(txt).textContent = label;
+}
+
+// ---------- Video: WebRTC / WHEP ----------
+let pc = null;
+async function startVideo() {
+  if (pc) { pc.close(); pc = null; }
+  setDot('vdot', 'vtxt', 'wait', 'video: conectando');
+  msg.textContent = 'Conectando al vídeo…';
+  pc = new RTCPeerConnection({ iceServers: [] });
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.ontrack = ev => {
+    video.srcObject = ev.streams[0];
+    try { ev.receiver.jitterBufferTarget = 0; } catch (_) {}   // lower latency where supported
+    try { ev.receiver.playoutDelayHint = 0; } catch (_) {}
+  };
+  pc.onconnectionstatechange = () => {
+    const s = pc.connectionState;
+    if (s === 'connected') { setDot('vdot','vtxt','ok','video: OK'); msg.textContent=''; }
+    else if (s === 'failed' || s === 'disconnected') {
+      setDot('vdot','vtxt','','video: ' + s); setTimeout(startVideo, 2000);
+    }
+  };
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await new Promise(res => {
+      if (pc.iceGatheringState === 'complete') return res();
+      pc.onicegatheringstatechange = () => pc.iceGatheringState === 'complete' && res();
+      setTimeout(res, 1500);
+    });
+    const r = await fetch(`${HTTP}://${HOST}:${WEBRTC}/${PATH}/whep`, {
+      method: 'POST', headers: { 'Content-Type': 'application/sdp' }, body: pc.localDescription.sdp
+    });
+    if (!r.ok) throw new Error('WHEP HTTP ' + r.status);
+    await pc.setRemoteDescription({ type: 'answer', sdp: await r.text() });
+  } catch (e) {
+    setDot('vdot','vtxt','','video: error');
+    msg.textContent = `No se pudo conectar al vídeo\n(${e.message})\n¿Está el script en marcha y publicando "${PATH}"?`;
+    setTimeout(startVideo, 3000);
+  }
+}
+
+// ---------- Input: WebSocket ----------
+let ws = null, wsTimer = null;
+function connectInput() {
+  clearTimeout(wsTimer);
+  if (ws) { ws.onclose = null; ws.close(); }
+  setDot('idot','itxt','wait','control: conectando');
+  ws = new WebSocket(WSBASE + (TOKEN ? `?token=${encodeURIComponent(TOKEN)}` : ''));
+  ws.onopen  = () => setDot('idot','itxt','ok','control: OK');
+  ws.onclose = () => { setDot('idot','itxt','','control: desconectado'); wsTimer = setTimeout(connectInput, 2000); };
+  ws.onerror = () => {};
+}
+const send = o => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+
+// Pointer position -> 0..1 inside the actual video picture (handles letterboxing)
+function norm(e) {
+  const r = video.getBoundingClientRect(), vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return null;
+  const s = Math.min(r.width / vw, r.height / vh), cw = vw * s, ch = vh * s;
+  const ox = r.left + (r.width - cw) / 2, oy = r.top + (r.height - ch) / 2;
+  const cl = v => Math.min(1, Math.max(0, v));
+  return { x: cl((e.clientX - ox) / cw), y: cl((e.clientY - oy) / ch) };
+}
+
+// Mouse move: at most one message per animation frame
+let pendingMove = null;
+function flushMove() {
+  if (pendingMove) { send({ t:'m', x:pendingMove.x, y:pendingMove.y }); pendingMove = null; }
+  requestAnimationFrame(flushMove);
+}
+requestAnimationFrame(flushMove);
+
+stage.addEventListener('pointermove', e => { const p = norm(e); if (p) pendingMove = p; });
+stage.addEventListener('pointerdown', e => {
+  stage.focus(); stage.setPointerCapture(e.pointerId);
+  const p = norm(e); if (!p) return;
+  pendingMove = null;
+  send({ t:'d', x:p.x, y:p.y, b: e.pointerType === 'touch' ? 0 : e.button });
+  $('hint').style.opacity = 0; e.preventDefault();
+});
+stage.addEventListener('pointerup', e => {
+  const p = norm(e); if (!p) return;
+  send({ t:'u', x:p.x, y:p.y, b: e.pointerType === 'touch' ? 0 : e.button });
+  e.preventDefault();
+});
+stage.addEventListener('wheel', e => {
+  const k = e.deltaMode === 1 ? 33 : 1;            // lines -> approx pixels
+  send({ t:'w', dx: e.deltaX * k, dy: e.deltaY * k });
+  e.preventDefault();
+}, { passive:false });
+stage.addEventListener('contextmenu', e => e.preventDefault());
+
+// Keyboard (only while the video area has focus)
+stage.addEventListener('keydown', e => { send({ t:'kd', k:e.key }); e.preventDefault(); });
+stage.addEventListener('keyup',   e => { send({ t:'ku', k:e.key }); e.preventDefault(); });
+stage.addEventListener('blur', () => {
+  // release modifiers so nothing stays "stuck" in the remote app
+  ['Shift','Control','Alt','Meta'].forEach(k => send({ t:'ku', k }));
+});
+
+// ---------- UI ----------
+$('btnReconnect').onclick = () => { startVideo(); connectInput(); };
+$('btnFull').onclick = () => (document.fullscreenElement ? document.exitFullscreen() : stage.requestFullscreen());
+
+// Small stats (resolution + received fps)
+let lastFrames = 0, lastT = performance.now();
+setInterval(async () => {
+  if (!pc) return;
+  try {
+    const stats = await pc.getStats();
+    stats.forEach(s => {
+      if (s.type === 'inbound-rtp' && s.kind === 'video') {
+        const now = performance.now(), fps = (s.framesDecoded - lastFrames) * 1000 / (now - lastT);
+        lastFrames = s.framesDecoded; lastT = now;
+        $('stats').textContent = `${video.videoWidth}×${video.videoHeight} · ${fps.toFixed(0)} fps`;
+      }
+    });
+  } catch (_) {}
+}, 1000);
+
+startVideo();
+connectInput();
+</script>
+</body>
+</html>
