@@ -22,8 +22,8 @@
 
 set -euo pipefail
 
-WIDTH="${WIDTH:-1920}"
-HEIGHT="${HEIGHT:-1080}"
+WIDTH="${WIDTH:-1280}"
+HEIGHT="${HEIGHT:-720}"
 FPS="${FPS:-30}"
 BITRATE="${BITRATE:-4000}"            # kbit/s
 ENCODER="${ENCODER:-x264enc}"         # x264enc | vah264enc | vaapih264enc | nvh264enc
@@ -144,9 +144,14 @@ if [[ $# -gt 0 ]]; then
   log "Weston's Xwayland display: $XDISP"
 
   log "Launching: ${APP[*]}  (log: /tmp/weston-app.log)"
-  if [[ "${APP[0]}" == "java" ]]; then
+  if [[ "${APP[0]}" == "java" || "${X11_ONLY:-0}" == "1" ]]; then
     # Java: use ONLY Weston's X11 display, hide the host's Wayland/X
-    env -u WAYLAND_DISPLAY DISPLAY="$XDISP" "${APP[@]}" >/tmp/weston-app.log 2>&1 &
+    # Unsetting WAYLAND_DISPLAY is NOT enough for GTK/Qt/Chromium/Firefox: libwayland falls back to the
+    # default socket "wayland-0", which is your HOST desktop. Force every toolkit to use X11 (Weston's Xwayland).
+    env -u WAYLAND_DISPLAY DISPLAY="$XDISP" XDG_SESSION_TYPE=x11 \
+        GDK_BACKEND=x11 QT_QPA_PLATFORM=xcb MOZ_ENABLE_WAYLAND=0 SDL_VIDEODRIVER=x11 \
+        CLUTTER_BACKEND=x11 ELECTRON_OZONE_PLATFORM_HINT=x11 \
+        "${APP[@]}" >/tmp/weston-app.log 2>&1 &
   else
     # Other apps: Wayland-native on Weston's socket, plus X11 fallback on Weston's Xwayland
     env WAYLAND_DISPLAY="$WL_SOCKET" DISPLAY="$XDISP" "${APP[@]}" >/tmp/weston-app.log 2>&1 &
@@ -161,6 +166,7 @@ if [[ $# -gt 0 ]]; then
       log "Starting input server on port ${INPUT_PORT:-8090}..."
       python3 "$INPUT_SERVER" --display "$XDISP" --host "${INPUT_HOST:-0.0.0.0}" \
         --port "${INPUT_PORT:-8090}" ${INPUT_TOKEN:+--token "$INPUT_TOKEN"} \
+        ${INPUT_DEBUG:+--debug} \
         >/tmp/weston-input.log 2>&1 &
       PIDS+=($!)
     else

@@ -377,3 +377,11 @@ Total	16
 ## 16. Challenge
    It works fine but if you see I'm using acceleration by HW with nvidia drivers (renderer gl) to check with intel integrated
    Should work directly detecting the card available, but performance may be an issue
+
+## 17. Final test touch (Mismo uso que una app pero para navegador) 
+   ### Firefox
+mkdir -p /tmp/ff-weston
+X11_ONLY=1 ./unido.sh firefox --no-remote --profile /tmp/ff-weston file:///ruta/a/touch-test.html or Final use website
+
+### o Chromium
+X11_ONLY=1 ./unido.sh chromium --user-data-dir=/tmp/chr-weston --ozone-platform=x11 file:///ruta/a/touch-test.html or Final use website

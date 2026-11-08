@@ -30,6 +30,9 @@
   #msg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
          text-align:center; padding:20px; color:var(--muted); pointer-events:none; white-space:pre-line; }
   #msg:empty { display:none; }
+  #dbg { position:absolute; top:8px; left:8px; z-index:5; max-width:min(520px,90%); display:none;
+         background:rgba(0,0,0,.78); color:#9ef0b4; font:12px/1.5 ui-monospace,monospace;
+         padding:8px 10px; border-radius:6px; pointer-events:none; white-space:pre-wrap; }
 </style>
 </head>
 <body>
@@ -39,12 +42,21 @@
   <span class="pill"><span id="idot" class="dot"></span><span id="itxt">control</span></span>
   <span class="pill" id="stats"></span>
   <span class="spacer"></span>
+  <label class="pill" title="Botón que se mantiene pulsado al arrastrar con dos dedos. JOSM mueve el mapa con el derecho; WorldWind y los mapas web con el izquierdo.">
+    Dos dedos arrastran con
+    <select id="panBtn">
+      <option value="0">botón izq.</option>
+      <option value="2">botón der.</option>
+      <option value="1">botón medio</option>
+    </select>
+  </label>
   <button id="btnReconnect">Reconectar</button>
   <button id="btnFull">Pantalla completa</button>
 </header>
 
 <div id="stage" tabindex="0">
   <video id="video" autoplay muted playsinline></video>
+  <div id="dbg"></div>
   <div id="msg">Conectando…</div>
   <div id="hint">Haz clic en el vídeo para controlar la app (ratón, rueda y teclado)</div>
 </div>
@@ -118,8 +130,44 @@ function connectInput() {
   ws.onopen  = () => setDot('idot','itxt','ok','control: OK');
   ws.onclose = () => { setDot('idot','itxt','','control: desconectado'); wsTimer = setTimeout(connectInput, 2000); };
   ws.onerror = () => {};
+  ws.onmessage = ev => {
+    try {
+      const m = JSON.parse(ev.data);
+      if (m.t === 'dbg') {
+        dbg.server = `puntero X=${m.pointer} (pantalla ${m.screen})\n` +
+                     `             ventana bajo el puntero: ${m.under_pointer}\n` +
+                     `             foco de teclado: ${m.keyboard_focus}`;
+        console.log('[server]', m);
+      }
+    } catch (_) {}
+  };
 }
-const send = o => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+// ---------- Debug overlay (open the page with ?debug=1) ----------
+const DEBUG = q.has('debug');
+const dbg = { sent:{m:0,d:0,u:0,w:0,kd:0,ku:0}, dropped:0, last:'-', server:'(sin respuesta aún)', pt:'(ninguno aún)', recent:[] };
+function renderDbg() {
+  if (!DEBUG) return;
+  const el = $('dbg'); el.style.display = 'block';
+  el.textContent =
+    `WS: ${ws ? ['conectando','abierto','cerrando','cerrado'][ws.readyState] : 'sin crear'}  → ${WSBASE}\n` +
+    `video: ${video.videoWidth}x${video.videoHeight}\n` +
+    `enviados: move=${dbg.sent.m} down=${dbg.sent.d} up=${dbg.sent.u} wheel=${dbg.sent.w} keydown=${dbg.sent.kd} keyup=${dbg.sent.ku}\n` +
+    `descartados (WS cerrado): ${dbg.dropped}\n` +
+    `tipo de puntero que da el navegador: ${dbg.pt}\n` +
+    `gestos: estado=${typeof tState === 'undefined' ? '-' : tState}  dedos=${typeof touches === 'undefined' ? 0 : touches.size}\n` +
+    `últimos mensajes (sin moves):\n  ${dbg.recent.join('\n  ') || '-'}\n` +
+    `servidor/X: ${dbg.server}`;
+}
+setInterval(renderDbg, 250);
+
+const send = o => {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify(o));
+    dbg.sent[o.t]++; dbg.last = JSON.stringify(o);
+    if (o.t !== 'm') { dbg.recent.push(JSON.stringify(o)); if (dbg.recent.length > 8) dbg.recent.shift(); }
+    if (DEBUG && o.t !== 'm') console.log('[send]', o);
+  } else { dbg.dropped++; }
+};
 
 // Pointer position -> 0..1 inside the actual video picture (handles letterboxing)
 function norm(e) {
@@ -139,19 +187,117 @@ function flushMove() {
 }
 requestAnimationFrame(flushMove);
 
-stage.addEventListener('pointermove', e => { const p = norm(e); if (p) pendingMove = p; });
+// ---------- Touch gestures (translated to mouse + wheel; works with any map app) ----------
+//  1 finger: tap = left click · drag = left-button drag · long press = right click
+//  2 fingers: pinch = mouse wheel at the pinch centre (zoom) · move together = drag with the chosen button
+const TAP_SLOP = 10, PAN_SLOP = 20, WHEEL_STEP = 40, LONG_MS = 500;
+const touches = new Map();          // pointerId -> {x, y} in client pixels
+let tState = 'idle';                // idle | pending | drag | long | two | ignore
+let tStart = null, tTimer = null, tLast = null;
+let lastDist = 0, startDist = 0, accum = 0, panning = false, panStart = null, lastCenter = null;
+
+const panSel = $('panBtn');
+if (q.get('pan')) panSel.value = q.get('pan');
+const panBtn = () => Number(panSel.value);
+
+const pts2 = () => [...touches.values()];
+const centerOf = p => ({ clientX: (p[0].x + p[1].x) / 2, clientY: (p[0].y + p[1].y) / 2 });
+const distOf = p => Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+const sendAt = (t, c, b) => { const p = norm(c); if (p) send({ t, x:p.x, y:p.y, ...(b === undefined ? {} : { b }) }); };
+
+function touchDown(e) {
+  touches.set(e.pointerId, { x:e.clientX, y:e.clientY });
+  if (touches.size === 1) {
+    tState = 'pending'; tStart = { clientX:e.clientX, clientY:e.clientY }; tLast = tStart;
+    clearTimeout(tTimer);
+    tTimer = setTimeout(() => {                     // long press -> right click
+      if (tState !== 'pending') return;
+      sendAt('m', tStart); sendAt('d', tStart, 2); sendAt('u', tStart, 2);
+      tState = 'long';
+    }, LONG_MS);
+  } else if (touches.size === 2) {
+    clearTimeout(tTimer);
+    if (tState === 'drag') sendAt('u', tLast, 0);   // release the 1-finger drag before changing mode
+    const p = pts2();
+    tState = 'two'; lastDist = startDist = distOf(p); accum = 0; panning = false;
+    panStart = lastCenter = centerOf(p);
+  }
+}
+
+function touchMove(e) {
+  const t = touches.get(e.pointerId); if (!t) return;
+  t.x = e.clientX; t.y = e.clientY;
+  if (tState === 'pending') {
+    if (Math.hypot(e.clientX - tStart.clientX, e.clientY - tStart.clientY) > TAP_SLOP) {
+      clearTimeout(tTimer);
+      sendAt('m', tStart); sendAt('d', tStart, 0);  // start left-button drag from where the finger landed
+      tState = 'drag';
+    }
+  }
+  if (tState === 'drag') {
+    tLast = { clientX:e.clientX, clientY:e.clientY };
+    const p = norm(tLast); if (p) pendingMove = p;
+  } else if (tState === 'two' && touches.size === 2) {
+    const p = pts2(), c = centerOf(p), d = distOf(p);
+    lastCenter = c;
+    accum += d - lastDist; lastDist = d;            // pinch -> wheel
+    const steps = Math.trunc(accum / WHEEL_STEP);
+    if (steps) {
+      accum -= steps * WHEEL_STEP;
+      sendAt('m', c);
+      send({ t:'w', dx:0, dy:-steps * 100 });       // fingers apart (steps > 0) = wheel up = zoom in
+    }
+    // Start a drag only if the fingers moved mostly TOGETHER (translation), not apart/closer (pinch).
+    // Events arrive one finger at a time, so a pinch briefly shifts the centre too: compare both.
+    const shift = Math.hypot(c.clientX - panStart.clientX, c.clientY - panStart.clientY);
+    if (!panning && shift > PAN_SLOP && Math.abs(d - startDist) < shift * 0.5) {
+      panning = true; sendAt('m', c); sendAt('d', c, panBtn());
+    }
+    if (panning) { const q2 = norm(c); if (q2) pendingMove = q2; }
+  }
+}
+
+function touchUp(e, cancelled) {
+  if (!touches.delete(e.pointerId)) return;
+  if (tState === 'pending' && touches.size === 0) {  // quick tap -> left click
+    clearTimeout(tTimer);
+    if (!cancelled) { sendAt('m', tStart); sendAt('d', tStart, 0); sendAt('u', tStart, 0); }
+    tState = 'idle';
+  } else if (tState === 'drag' && touches.size === 0) {
+    sendAt('u', { clientX:e.clientX, clientY:e.clientY }, 0); tState = 'idle';
+  } else if (tState === 'long') {
+    if (touches.size === 0) tState = 'idle';
+  } else if (tState === 'two') {
+    if (panning) sendAt('u', lastCenter, panBtn());
+    panning = false;
+    tState = touches.size === 0 ? 'idle' : 'ignore'; // wait until all fingers are up
+  } else if (tState === 'ignore' && touches.size === 0) {
+    tState = 'idle';
+  }
+}
+
+// ---------- Pointer events: mouse/pen as before, touch through the gesture code ----------
+stage.addEventListener('pointermove', e => {
+  dbg.pt = e.pointerType;
+  if (e.pointerType === 'touch') return touchMove(e);
+  const p = norm(e); if (p) pendingMove = p;
+});
 stage.addEventListener('pointerdown', e => {
+  dbg.pt = e.pointerType + ' (id ' + e.pointerId + ')';
   stage.focus(); stage.setPointerCapture(e.pointerId);
+  $('hint').style.opacity = 0; e.preventDefault();
+  if (e.pointerType === 'touch') return touchDown(e);
   const p = norm(e); if (!p) return;
   pendingMove = null;
-  send({ t:'d', x:p.x, y:p.y, b: e.pointerType === 'touch' ? 0 : e.button });
-  $('hint').style.opacity = 0; e.preventDefault();
+  send({ t:'d', x:p.x, y:p.y, b: e.button });
 });
 stage.addEventListener('pointerup', e => {
-  const p = norm(e); if (!p) return;
-  send({ t:'u', x:p.x, y:p.y, b: e.pointerType === 'touch' ? 0 : e.button });
   e.preventDefault();
+  if (e.pointerType === 'touch') return touchUp(e, false);
+  const p = norm(e); if (!p) return;
+  send({ t:'u', x:p.x, y:p.y, b: e.button });
 });
+stage.addEventListener('pointercancel', e => { if (e.pointerType === 'touch') touchUp(e, true); });
 stage.addEventListener('wheel', e => {
   const k = e.deltaMode === 1 ? 33 : 1;            // lines -> approx pixels
   send({ t:'w', dx: e.deltaX * k, dy: e.deltaY * k });

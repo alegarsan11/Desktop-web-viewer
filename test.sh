@@ -5,6 +5,7 @@
 #   ./probar.sh josm         # editor de mapas 2D (descarga josm-tested.jar si falta)
 #   ./probar.sh worldwind    # globo 3D de la NASA (demo run-demo.bash)
 #   ./probar.sh gears        # glxgears (prueba mínima de GPU)
+#   ./probar.sh web [URL]    # Firefox dentro de Weston (por defecto Google Maps)
 #
 # Variables opcionales:
 #   MAIN=./unido.sh          script principal (por defecto: unido.sh o weston-gpu-to-mediamtx.sh)
@@ -67,8 +68,35 @@ case "${1:-}" in
     exec bash "$MAIN" glxgears
     ;;
 
+  web|firefox|maps)
+    # Firefox dentro de Weston. Por defecto abre Google Maps; otra URL: ./probar.sh web https://...
+    command -v firefox >/dev/null || die "Falta firefox (sudo pacman -S firefox)"
+    URL="${2:-https://www.google.com/maps}"
+    # https://earth3dmap.com/3d-globe/ Interactive 3d map
+    PROFILE="${FF_PROFILE:-/tmp/ff-weston}"
+    mkdir -p "$PROFILE"
+    # Perfil limpio y aparte: evita que la URL se abra en TU Firefox del escritorio
+    # y se salta las pantallas de bienvenida.
+    if [[ ! -f "$PROFILE/user.js" ]]; then
+      cat >"$PROFILE/user.js" <<'EOF2'
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("trailhead.firstrun.didSeeAboutWelcome", true);
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.tabs.warnOnClose", false);
+EOF2
+    fi
+    FF_ARGS=(--no-remote --profile "$PROFILE")
+    [[ "${FF_KIOSK:-0}" == "1" ]] && FF_ARGS+=(--kiosk)    # FF_KIOSK=1 oculta la interfaz del navegador
+    log "Lanzando Firefox en Weston: $URL"
+    [[ "$URL" == *google* ]] && log "Si sale el aviso de cookies de Google, acéptalo desde la interfaz remota (la primera vez)."
+    X11_ONLY=1 exec bash "$MAIN" firefox "${FF_ARGS[@]}" "$URL"
+    ;;
+
   *)
-    echo "Uso: $0 {josm|worldwind|gears}"
+    echo "Uso: $0 {josm|worldwind|gears|web [URL]}"
+    echo "  web   -> Firefox con Google Maps (o la URL que indiques); FF_KIOSK=1 oculta la interfaz"
     exit 1
     ;;
 esac
